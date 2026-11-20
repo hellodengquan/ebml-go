@@ -1181,6 +1181,423 @@ func TestBlockWriter_WithCues(t *testing.T) {
 	})
 }
 
+// trackStatsTestSegment is the EBML segment structure used by track stats tests.
+type trackStatsTestSegment struct {
+	SeekHead *struct {
+		Seek []struct {
+			SeekID       []byte `ebml:"SeekID"`
+			SeekPosition uint64 `ebml:"SeekPosition,size=8"`
+		} `ebml:"Seek"`
+	} `ebml:"SeekHead"`
+	Info   interface{} `ebml:"Info"`
+	Tracks flexTracks  `ebml:"Tracks"`
+	Cues   *struct {
+		CuePoint []struct{} `ebml:"CuePoint"`
+	} `ebml:"Cues"`
+	Cluster []simpleBlockCluster `ebml:"Cluster,size=unknown"`
+	Tags    *struct {
+		Tag []struct {
+			Targets struct {
+				TargetTypeValue uint64   `ebml:"TargetTypeValue"`
+				TargetType      string   `ebml:"TargetType"`
+				TagTrackUID     []uint64 `ebml:"TagTrackUID"`
+			} `ebml:"Targets"`
+			SimpleTag []struct {
+				TagName   string `ebml:"TagName"`
+				TagString string `ebml:"TagString"`
+			} `ebml:"SimpleTag"`
+		} `ebml:"Tag"`
+	} `ebml:"Tags"`
+}
+
+// statsTrackEntry is a TrackEntry with an ebml-tagged TrackUID, as used by the
+// upper-level webm/mkv packages.
+type statsTrackEntry struct {
+	TrackNumber uint64 `ebml:"TrackNumber"`
+	TrackUID    uint64 `ebml:"TrackUID"`
+	CodecID     string `ebml:"CodecID"`
+	TrackType   uint64 `ebml:"TrackType"`
+}
+
+func TestBlockWriter_WithTrackStats(t *testing.T) {
+	writerFactories := map[string]func() testBuffer{
+		"WriteSeeker": newSeekableBuffer,
+		"WriterAt":    newWriteAtBuffer,
+	}
+	for name, writerFactory := range writerFactories {
+		writerFactory := writerFactory
+		t.Run(name, func(t *testing.T) {
+			t.Run("StatsWrittenAndSeekable", func(t *testing.T) {
+				buf := writerFactory()
+				tracks := []TrackDescription{
+					{TrackNumber: 1, TrackEntry: &statsTrackEntry{TrackNumber: 1, TrackUID: 111, CodecID: "V_VP8", TrackType: 1}},
+					{TrackNumber: 2, TrackEntry: &statsTrackEntry{TrackNumber: 2, TrackUID: 222, CodecID: "A_OPUS", TrackType: 2}},
+				}
+				ws, err := NewSimpleBlockWriter(
+					buf, tracks,
+					WithEBMLHeader(nil),
+					WithSegmentInfo(&struct {
+						TimecodeScale uint64 `ebml:"TimecodeScale"`
+					}{TimecodeScale: 1000000}),
+					WithSeekHead(true),
+					WithTrackStats(true),
+				)
+				if err != nil {
+					t.Fatalf("Failed to create BlockWriter: '%v'", err)
+				}
+
+				// Track 1: 2 frames, 4+1 payload bytes, 33ms span.
+				if _, err := ws[0].Write(true, 0, []byte{0x01, 0x02, 0x03, 0x04}); err != nil {
+					t.Fatalf("Failed to Write: '%v'", err)
+				}
+				// Track 2: 1 frame, 2 bytes, zero duration.
+				if _, err := ws[1].Write(true, 10, []byte{0x09, 0x09}); err != nil {
+					t.Fatalf("Failed to Write: '%v'", err)
+				}
+				if _, err := ws[0].Write(false, 33, []byte{0x05}); err != nil {
+					t.Fatalf("Failed to Write: '%v'", err)
+				}
+				ws[0].Close()
+				ws[1].Close()
+				<-buf.Closed()
+
+				data := buf.Bytes()
+
+				// Locate the Segment data start (unknown-size Segment:
+				// 4-byte ID + 8-byte size VINT).
+				segmentIdx := bytes.Index(data, []byte{0x18, 0x53, 0x80, 0x67})
+				if segmentIdx < 0 {
+					t.Fatal("Segment element not found")
+				}
+				segmentDataStart := segmentIdx + 4 + 8
+
+				var result struct {
+					Segment trackStatsTestSegment `ebml:"Segment,size=unknown"`
+				}
+				if err := ebml.Unmarshal(bytes.NewReader(data), &result); err != nil {
+					t.Fatalf("Failed to Unmarshal: '%v'", err)
+				}
+
+				if result.Segment.Tags == nil {
+					t.Fatal("Expected Tags element, got nil")
+				}
+				if len(result.Segment.Tags.Tag) != 2 {
+					t.Fatalf("Expected 2 Tag elements, got %d", len(result.Segment.Tags.Tag))
+				}
+
+				wantStats := map[uint64]map[string]string{
+					111: {
+						"NUMBER_OF_FRAMES": "2",
+						"NUMBER_OF_BYTES":  "5",
+						"DURATION":         "00:00:00.033000000",
+					},
+					222: {
+						"NUMBER_OF_FRAMES": "1",
+						"NUMBER_OF_BYTES":  "2",
+						"DURATION":         "00:00:00.000000000",
+					},
+				}
+				for _, tg := range result.Segment.Tags.Tag {
+					if len(tg.Targets.TagTrackUID) != 1 {
+						t.Fatalf("Expected one TagTrackUID, got %v", tg.Targets.TagTrackUID)
+					}
+					uid := tg.Targets.TagTrackUID[0]
+					if tg.Targets.TargetTypeValue != 6 || tg.Targets.TargetType != "track" {
+						t.Errorf("Tag for UID %d has unexpected Targets: %+v", uid, tg.Targets)
+					}
+					want, ok := wantStats[uid]
+					if !ok {
+						t.Errorf("Unexpected TagTrackUID %d", uid)
+						continue
+					}
+					if len(tg.SimpleTag) != 3 {
+						t.Fatalf("UID %d: expected 3 SimpleTags, got %d", uid, len(tg.SimpleTag))
+					}
+					for _, st := range tg.SimpleTag {
+						if st.TagString != want[st.TagName] {
+							t.Errorf("UID %d %s: got %q, want %q", uid, st.TagName, st.TagString, want[st.TagName])
+						}
+					}
+				}
+
+				// The SeekHead must contain a Tags entry whose SeekPosition
+				// points exactly at the Tags element after the Clusters.
+				var tagsSeekPos uint64
+				var found bool
+				for _, seek := range result.Segment.SeekHead.Seek {
+					if bytes.Equal(seek.SeekID, ebml.ElementTags.Bytes()) {
+						tagsSeekPos = seek.SeekPosition
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Fatal("SeekHead has no Tags entry")
+				}
+				tagsAbsPos := segmentDataStart + int(tagsSeekPos)
+				if tagsAbsPos+4 > len(data) {
+					t.Fatalf("Tags seek position %d beyond file size %d", tagsAbsPos, len(data))
+				}
+				if got := data[tagsAbsPos : tagsAbsPos+4]; !bytes.Equal(got, ebml.ElementTags.Bytes()) {
+					t.Errorf("SeekHead Tags position points to %X, want Tags ID %X", got, ebml.ElementTags.Bytes())
+				}
+			})
+
+			t.Run("NanoPrecisionWithCustomTimecodeScale", func(t *testing.T) {
+				buf := writerFactory()
+				tracks := []TrackDescription{
+					{TrackNumber: 1, TrackEntry: &statsTrackEntry{TrackNumber: 1, TrackUID: 111, TrackType: 1}},
+				}
+				ws, err := NewSimpleBlockWriter(
+					buf, tracks,
+					WithEBMLHeader(nil),
+					WithSegmentInfo(&struct {
+						TimecodeScale uint64 `ebml:"TimecodeScale"`
+					}{TimecodeScale: 2500}), // 2.5 us per timecode unit
+					WithSeekHead(true),
+					WithTrackStats(true),
+				)
+				if err != nil {
+					t.Fatalf("Failed to create BlockWriter: '%v'", err)
+				}
+				// 3 units span * 2500 ns = 7500 ns, sub-microsecond precision.
+				if _, err := ws[0].Write(true, 100, []byte{0x01}); err != nil {
+					t.Fatalf("Failed to Write: '%v'", err)
+				}
+				if _, err := ws[0].Write(false, 103, []byte{0x02, 0x03}); err != nil {
+					t.Fatalf("Failed to Write: '%v'", err)
+				}
+				ws[0].Close()
+				<-buf.Closed()
+
+				var result struct {
+					Segment trackStatsTestSegment `ebml:"Segment,size=unknown"`
+				}
+				if err := ebml.Unmarshal(bytes.NewReader(buf.Bytes()), &result); err != nil {
+					t.Fatalf("Failed to Unmarshal: '%v'", err)
+				}
+				if result.Segment.Tags == nil || len(result.Segment.Tags.Tag) != 1 {
+					t.Fatal("Expected exactly one Tag element")
+				}
+				values := map[string]string{}
+				for _, st := range result.Segment.Tags.Tag[0].SimpleTag {
+					values[st.TagName] = st.TagString
+				}
+				if values["DURATION"] != "00:00:00.000007500" {
+					t.Errorf("DURATION: got %q, want 00:00:00.000007500", values["DURATION"])
+				}
+				if values["NUMBER_OF_FRAMES"] != "2" || values["NUMBER_OF_BYTES"] != "3" {
+					t.Errorf("unexpected counters: %v", values)
+				}
+			})
+
+			t.Run("NoFrames", func(t *testing.T) {
+				buf := writerFactory()
+				tracks := []TrackDescription{
+					{TrackNumber: 1, TrackEntry: &statsTrackEntry{TrackNumber: 1, TrackUID: 111, TrackType: 1}},
+				}
+				ws, err := NewSimpleBlockWriter(
+					buf, tracks,
+					WithEBMLHeader(nil),
+					WithSegmentInfo(nil),
+					WithSeekHead(true),
+					WithTrackStats(true),
+				)
+				if err != nil {
+					t.Fatalf("Failed to create BlockWriter: '%v'", err)
+				}
+				ws[0].Close()
+				<-buf.Closed()
+
+				var result struct {
+					Segment trackStatsTestSegment `ebml:"Segment,size=unknown"`
+				}
+				if err := ebml.Unmarshal(bytes.NewReader(buf.Bytes()), &result); err != nil {
+					t.Fatalf("Failed to Unmarshal: '%v'", err)
+				}
+				if result.Segment.Tags == nil || len(result.Segment.Tags.Tag) != 1 {
+					t.Fatal("Expected a Tag even when no frames were written")
+				}
+				values := map[string]string{}
+				for _, st := range result.Segment.Tags.Tag[0].SimpleTag {
+					values[st.TagName] = st.TagString
+				}
+				if values["NUMBER_OF_FRAMES"] != "0" || values["NUMBER_OF_BYTES"] != "0" {
+					t.Errorf("expected zeroed counters, got %v", values)
+				}
+				if values["DURATION"] != "00:00:00.000000000" {
+					t.Errorf("expected zero duration, got %q", values["DURATION"])
+				}
+			})
+
+			t.Run("CustomMarshalDataSizeLen", func(t *testing.T) {
+				// WithDataSizeLen changes VINT lengths in the SeekHead. The
+				// Tags SeekPosition lookup must remain correct.
+				buf := writerFactory()
+				tracks := []TrackDescription{
+					{TrackNumber: 1, TrackEntry: &statsTrackEntry{TrackNumber: 1, TrackUID: 111, TrackType: 1}},
+				}
+				ws, err := NewSimpleBlockWriter(
+					buf, tracks,
+					WithEBMLHeader(nil),
+					WithSegmentInfo(&struct {
+						TimecodeScale uint64 `ebml:"TimecodeScale"`
+					}{TimecodeScale: 1000000}),
+					WithSeekHead(true),
+					WithTrackStats(true),
+					WithMarshalOptions(ebml.WithDataSizeLen(2)),
+				)
+				if err != nil {
+					t.Fatalf("Failed to create BlockWriter: '%v'", err)
+				}
+				if _, err := ws[0].Write(true, 0, []byte{0x01, 0x02}); err != nil {
+					t.Fatalf("Failed to Write: '%v'", err)
+				}
+				ws[0].Close()
+				<-buf.Closed()
+
+				data := buf.Bytes()
+				segmentIdx := bytes.Index(data, []byte{0x18, 0x53, 0x80, 0x67})
+				segmentDataStart := segmentIdx + 4 + 8
+
+				var result struct {
+					Segment trackStatsTestSegment `ebml:"Segment,size=unknown"`
+				}
+				if err := ebml.Unmarshal(bytes.NewReader(data), &result); err != nil {
+					t.Fatalf("Failed to Unmarshal: '%v'", err)
+				}
+				var tagsSeekPos uint64
+				var found bool
+				for _, seek := range result.Segment.SeekHead.Seek {
+					if bytes.Equal(seek.SeekID, ebml.ElementTags.Bytes()) {
+						tagsSeekPos = seek.SeekPosition
+						found = true
+					}
+				}
+				if !found {
+					t.Fatal("SeekHead has no Tags entry")
+				}
+				tagsAbsPos := segmentDataStart + int(tagsSeekPos)
+				if got := data[tagsAbsPos : tagsAbsPos+4]; !bytes.Equal(got, ebml.ElementTags.Bytes()) {
+					t.Errorf("Tags SeekPosition points to %X, want Tags ID %X", got, ebml.ElementTags.Bytes())
+				}
+			})
+
+			t.Run("CoexistsWithCues", func(t *testing.T) {
+				buf := writerFactory()
+				tracks := []TrackDescription{
+					{TrackNumber: 1, TrackEntry: &statsTrackEntry{TrackNumber: 1, TrackUID: 111, TrackType: 1}},
+				}
+				ws, err := NewSimpleBlockWriter(
+					buf, tracks,
+					WithEBMLHeader(nil),
+					WithSegmentInfo(&struct {
+						TimecodeScale uint64 `ebml:"TimecodeScale"`
+					}{TimecodeScale: 1000000}),
+					WithSeekHead(true),
+					WithCues(4096),
+					WithTrackStats(true),
+				)
+				if err != nil {
+					t.Fatalf("Failed to create BlockWriter: '%v'", err)
+				}
+				for i := 0; i < 5; i++ {
+					if _, err := ws[0].Write(true, int64(i)*0x8000, []byte{0x01}); err != nil {
+						t.Fatalf("Failed to Write: '%v'", err)
+					}
+				}
+				ws[0].Close()
+				<-buf.Closed()
+
+				var result struct {
+					Segment trackStatsTestSegment `ebml:"Segment,size=unknown"`
+				}
+				if err := ebml.Unmarshal(bytes.NewReader(buf.Bytes()), &result); err != nil {
+					t.Fatalf("Failed to Unmarshal: '%v'", err)
+				}
+
+				// The playback index must remain available.
+				if result.Segment.Cues == nil {
+					t.Error("Cues element missing when used together with track stats")
+				} else if len(result.Segment.Cues.CuePoint) != 5 {
+					t.Errorf("expected 5 CuePoints, got %d", len(result.Segment.Cues.CuePoint))
+				}
+				if result.Segment.Tags == nil {
+					t.Fatal("Tags element missing when used together with Cues")
+				}
+
+				// Both Cues and Tags must be reachable through the SeekHead.
+				seen := map[string]bool{}
+				for _, seek := range result.Segment.SeekHead.Seek {
+					switch {
+					case bytes.Equal(seek.SeekID, ebml.ElementCues.Bytes()):
+						seen["Cues"] = true
+					case bytes.Equal(seek.SeekID, ebml.ElementTags.Bytes()):
+						seen["Tags"] = true
+					}
+				}
+				if !seen["Cues"] || !seen["Tags"] {
+					t.Errorf("SeekHead missing entries, got %v", seen)
+				}
+
+				// Frames are still playable: clusters and SimpleBlocks remain.
+				if len(result.Segment.Cluster) == 0 {
+					t.Error("no clusters written")
+				}
+			})
+		})
+	}
+
+	t.Run("ValidationRequiresSeekHead", func(t *testing.T) {
+		buf := newSeekableBuffer()
+		_, err := NewSimpleBlockWriter(
+			buf,
+			[]TrackDescription{{TrackNumber: 1, TrackEntry: &statsTrackEntry{TrackNumber: 1, TrackUID: 111}}},
+			WithEBMLHeader(nil),
+			WithSegmentInfo(nil),
+			WithTrackStats(true),
+		)
+		if !errors.Is(err, ErrTrackStatsRequiresSeekHead) {
+			t.Errorf("Expected error: '%v', got: '%v'", ErrTrackStatsRequiresSeekHead, err)
+		}
+	})
+
+	t.Run("ValidationRequiresSeeker", func(t *testing.T) {
+		buf := buffercloser.New() // not an io.WriteSeeker or io.WriterAt
+		_, err := NewSimpleBlockWriter(
+			buf,
+			[]TrackDescription{{TrackNumber: 1, TrackEntry: &statsTrackEntry{TrackNumber: 1, TrackUID: 111}}},
+			WithEBMLHeader(nil),
+			WithSegmentInfo(nil),
+			WithSeekHead(true),
+			WithTrackStats(true),
+		)
+		if !errors.Is(err, ErrTrackStatsRequiresSeeker) {
+			t.Errorf("Expected error: '%v', got: '%v'", ErrTrackStatsRequiresSeeker, err)
+		}
+	})
+
+	t.Run("ValidationRequiresTrackUID", func(t *testing.T) {
+		buf := newSeekableBuffer()
+		// mkvcore.TrackEntry has a TrackUID field; use a struct without one.
+		type noUIDEntry struct {
+			TrackNumber uint64 `ebml:"TrackNumber"`
+			CodecID     string `ebml:"CodecID"`
+		}
+		_, err := NewSimpleBlockWriter(
+			buf,
+			[]TrackDescription{{TrackNumber: 1, TrackEntry: &noUIDEntry{TrackNumber: 1}}},
+			WithEBMLHeader(nil),
+			WithSegmentInfo(nil),
+			WithSeekHead(true),
+			WithTrackStats(true),
+		)
+		if !errors.Is(err, ErrTrackStatsMissingTrackUID) {
+			t.Errorf("Expected error: '%v', got: '%v'", ErrTrackStatsMissingTrackUID, err)
+		}
+	})
+}
+
 func TestVoidElement(t *testing.T) {
 	for _, size := range []int{9, 100, 4096, 51200} {
 		b := voidElement(size)

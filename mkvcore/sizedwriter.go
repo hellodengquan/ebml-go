@@ -19,12 +19,14 @@ import (
 )
 
 type writerWithSizeCount struct {
-	size int
-	w    io.WriteCloser
+	size  int
+	total int
+	w     io.WriteCloser
 }
 
 func (w *writerWithSizeCount) Write(b []byte) (int, error) {
 	w.size += len(b)
+	w.total += len(b)
 	return w.w.Write(b)
 }
 
@@ -38,4 +40,10 @@ func (w *writerWithSizeCount) Close() error {
 
 func (w *writerWithSizeCount) Size() int {
 	return w.size
+}
+
+// Total returns the cumulative number of bytes written since creation,
+// unaffected by Clear. It is the absolute position of the next write.
+func (w *writerWithSizeCount) Total() int {
+	return w.total
 }

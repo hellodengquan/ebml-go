@@ -32,6 +32,25 @@ var ErrCuesRequiresSeeker = errors.New("WithCues requires an io.WriteSeeker or i
 // ErrCuesReservedTooSmall means WithCues was called with a reservedSize smaller than 9 bytes.
 var ErrCuesReservedTooSmall = errors.New("WithCues reservedSize must be at least 9")
 
+// ErrTrackStatsRequiresSeekHead means WithTrackStats was used without WithSeekHead.
+var ErrTrackStatsRequiresSeekHead = errors.New("WithTrackStats requires WithSeekHead")
+
+// ErrTrackStatsRequiresSeeker means WithTrackStats was used with a writer that does not implement either io.WriteSeeker or io.WriterAt.
+var ErrTrackStatsRequiresSeeker = errors.New("WithTrackStats requires an io.WriteSeeker or io.WriterAt")
+
+// ErrTrackStatsMissingTrackUID means WithTrackStats was used with a TrackEntry that does not expose a TrackUID field.
+var ErrTrackStatsMissingTrackUID = errors.New("WithTrackStats requires TrackEntry with a TrackUID")
+
+// ErrTrackStatsSeekPositionNotFound means the SeekPosition slot for the Tags element could not be located in the generated SeekHead.
+var ErrTrackStatsSeekPositionNotFound = errors.New("track stats Tags SeekPosition not found in SeekHead")
+
+// ErrTrackStatsSeekPositionOverflow means the Tags offset does not fit in the SeekPosition field width produced by the active marshal options.
+var ErrTrackStatsSeekPositionOverflow = errors.New("track stats Tags SeekPosition overflows the SeekPosition field")
+
+// defaultTimecodeScale is the Matroska default TimecodeScale in nanoseconds
+// (1 ms per timecode unit), used when Segment.Info has no TimecodeScale field.
+const defaultTimecodeScale = 1000000
+
 // ErrDurationInClusterOutOfRange means that a duration is not in the valid range. Duration in a cluster must be between 0 and 0x7FFF.
 var ErrDurationInClusterOutOfRange = errors.New("duration in cluster out of range")
 
@@ -104,6 +123,7 @@ type BlockWriterOptions struct {
 	interceptor        BlockInterceptor
 	mainTrackNumber    uint64
 	cuesReservedSize   int
+	trackStats         bool
 	minClusterDuration int64
 	maxClusterDuration int64
 }
@@ -160,6 +180,25 @@ func WithCues(reservedSize int) BlockWriterOptionFn {
 			return ErrCuesReservedTooSmall
 		}
 		o.cuesReservedSize = reservedSize
+		return nil
+	}
+}
+
+// WithTrackStats enables writing a top-level Tags element with per-track
+// statistics when the recording is finalized. Each Tag is attributed to its
+// track by TagTrackUID and carries three SimpleTags:
+// NUMBER_OF_FRAMES (frames actually written to the track),
+// NUMBER_OF_BYTES (payload bytes actually written), and
+// DURATION (track duration in nanoseconds, formatted HH:MM:SS.nnnnnnnnn).
+//
+// The Tags element is appended after the last Cluster and a SeekHead entry is
+// added so readers can find it from the file header. Because the SeekHead
+// position must be patched after the Tags position is known, the option
+// requires WithSeekHead(true) and an io.WriteSeeker or io.WriterAt.
+// Every TrackEntry must expose a non-nil TrackUID.
+func WithTrackStats(enable bool) BlockWriterOptionFn {
+	return func(o *BlockWriterOptions) error {
+		o.trackStats = enable
 		return nil
 	}
 }

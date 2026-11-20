@@ -93,8 +93,11 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 
 	// Validate Cues requirements
 	var writerAt io.WriterAt
-	if options.cuesReservedSize > 0 {
+	if options.cuesReservedSize > 0 || options.trackStats {
 		if !options.seekHead {
+			if options.trackStats {
+				return nil, ErrTrackStatsRequiresSeekHead
+			}
 			return nil, ErrCuesRequiresSeekHead
 		}
 		var ok bool
@@ -102,11 +105,27 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 		if !ok {
 			seeker, ok := w0.(io.WriteSeeker)
 			if !ok {
+				if options.trackStats {
+					return nil, ErrTrackStatsRequiresSeeker
+				}
 				return nil, ErrCuesRequiresSeeker
 			}
 			writerAt = &writerAtBySeeker{
 				WriteSeeker: seeker,
 			}
+		}
+	}
+
+	// Track statistics require a TrackUID on every TrackEntry so each Tag can
+	// be attributed to its track.
+	var trackUIDs []uint64
+	if options.trackStats {
+		for _, t := range tracks {
+			uid, ok := extractTrackUID(t.TrackEntry)
+			if !ok {
+				return nil, ErrTrackStatsMissingTrackUID
+			}
+			trackUIDs = append(trackUIDs, uid)
 		}
 	}
 
@@ -132,10 +151,12 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 	}
 
 	var durationElementPos uint64
+	var tagsSeekPositionPos uint64
+	var tagsSeekPositionLen uint64
 	var segmentDataStart uint64
 	if options.seekHead {
 		var err error
-		segmentDataStart, durationElementPos, err = setSeekHead(&header, options.cuesReservedSize > 0, options.marshalOpts...)
+		segmentDataStart, durationElementPos, tagsSeekPositionPos, tagsSeekPositionLen, err = setSeekHead(&header, options.cuesReservedSize > 0, options.trackStats, options.marshalOpts...)
 		if err != nil {
 			return nil, err
 		}
@@ -158,6 +179,23 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 
 	w.Clear()
 
+	// Per-track statistics, indexed by TrackUID (the value that identifies
+	// each Tag in the output). The option's requirements (SeekHead, seekable
+	// writer, TrackUID) have already been validated.
+	var trackStatsMap map[uint64]*trackStats
+	var trackNumberToUID map[uint64]uint64
+	var timecodeScale uint64 = defaultTimecodeScale
+	if options.trackStats {
+		trackStatsMap = make(map[uint64]*trackStats, len(tracks))
+		trackNumberToUID = make(map[uint64]uint64, len(tracks))
+		for i, t := range tracks {
+			trackStatsMap[trackUIDs[i]] = &trackStats{trackUID: trackUIDs[i]}
+			trackNumberToUID[t.TrackNumber] = trackUIDs[i]
+		}
+		if scale, ok := extractTimecodeScale(options.segmentInfo); ok && scale > 0 {
+			timecodeScale = scale
+		}
+	}
 	ch := make(chan *frame)
 	fin := make(chan struct{}, len(tracks)-1)
 	wg := sync.WaitGroup{}
@@ -255,6 +293,16 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 				}
 			}
 
+			// Append per-track statistics Tags after the last Cluster and
+			// patch the Tags SeekPosition in the header SeekHead.
+			if options.trackStats {
+				writeTrackStats(
+					writerAt, w, trackStatsMap, trackUIDs, timecodeScale,
+					segmentDataStart, tagsSeekPositionPos, tagsSeekPositionLen,
+					options.marshalOpts, options.onFatal,
+				)
+			}
+
 			w.Close()
 			<-fin // read one data to release blocked Close()
 		}()
@@ -329,6 +377,13 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 						options.onFatal(err)
 					}
 					return
+				}
+				if trackStatsMap != nil {
+					if uid, ok := trackNumberToUID[f.trackNumber]; ok {
+						if st, ok := trackStatsMap[uid]; ok {
+							st.add(f.timestamp, len(f.b))
+						}
+					}
 				}
 			}
 		}
