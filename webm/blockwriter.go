@@ -22,7 +22,8 @@ import (
 )
 
 // NewSimpleBlockWriter creates BlockWriteCloser for each track specified as tracks argument.
-// Blocks will be written to WebM as EBML SimpleBlocks.
+// Blocks will be written to WebM as EBML SimpleBlocks, or as EBML BlockGroups
+// with BlockDuration when written by WriteBlockGroup (see WriteWebVTTEvent).
 // Resultant WebM is written to given io.WriteCloser and will be closed automatically; don't close it by yourself.
 // Frames written to each track must be sorted by their timestamp.
 func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackEntry, opts ...mkvcore.BlockWriterOption) ([]BlockWriteCloser, error) {

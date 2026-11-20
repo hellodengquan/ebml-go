@@ -54,12 +54,53 @@ func (w *filterWriter) Write(keyframe bool, timestamp int64, b []byte) (int, err
 	return len(b), nil
 }
 
+func (w *filterWriter) WriteBlockGroup(keyframe bool, timestamp, duration int64, b []byte) (int, error) {
+	if duration < 0 {
+		return 0, ErrInvalidBlockDuration
+	}
+	w.ch <- &frame{
+		trackNumber: w.trackNumber,
+		keyframe:    keyframe,
+		timestamp:   timestamp,
+		b:           b,
+		duration:    duration,
+		blockGroup:  true,
+	}
+	return len(b), nil
+}
+
 func (r *filterReader) Read() ([]byte, bool, int64, error) {
 	frame, ok := <-r.ch
 	if !ok {
 		return nil, false, 0, io.EOF
 	}
 	return frame.b, frame.keyframe, frame.timestamp, nil
+}
+
+// ReadBlockGroup reads a frame with its block group information.
+// It also returns frames written by Write; in that case duration is 0.
+func (r *filterReader) ReadBlockGroup() ([]byte, bool, int64, int64, error) {
+	frame, ok := <-r.ch
+	if !ok {
+		return nil, false, 0, 0, io.EOF
+	}
+	return frame.b, frame.keyframe, frame.timestamp, frame.duration, nil
+}
+
+// readFrame reads the whole frame including the internal block group flag.
+func (r *filterReader) readFrame() (*frame, error) {
+	frame, ok := <-r.ch
+	if !ok {
+		return nil, io.EOF
+	}
+	return frame, nil
+}
+
+// frameReader is implemented by internal readers that expose the whole frame,
+// preserving information which is not a part of the public BlockReader API,
+// e.g. whether a duration-less frame was written as a BlockGroup.
+type frameReader interface {
+	readFrame() (*frame, error)
 }
 
 func (r *filterReader) close() {
@@ -152,17 +193,38 @@ func (s *multiTrackBlockSorter) Intercept(r []BlockReader, w []BlockWriter) {
 
 	ch := make(chan *frame)
 	for i, r := range r {
-		go func(i int, r BlockReader) {
+		fr, isFrameReader := r.(frameReader)
+		gr, isGroupReader := r.(BlockGroupReader)
+		go func(i int, r BlockReader, fr frameReader, gr BlockGroupReader, hasFrame, hasGroup bool) {
 			for {
 				var err error
 				f := &frame{trackNumber: uint64(i)}
-				if f.b, f.keyframe, f.timestamp, err = r.Read(); err != nil {
+				switch {
+				case hasFrame:
+					// Fast path for the internal reader: it preserves the
+					// block group flag even when the duration is 0.
+					var ff *frame
+					if ff, err = fr.readFrame(); err == nil {
+						*f = *ff
+						f.trackNumber = uint64(i)
+					}
+				case hasGroup:
+					var duration int64
+					f.b, f.keyframe, f.timestamp, duration, err = gr.ReadBlockGroup()
+					// Frames carrying a BlockDuration must be written back as
+					// a BlockGroup to keep the duration.
+					f.duration = duration
+					f.blockGroup = duration != 0
+				default:
+					f.b, f.keyframe, f.timestamp, err = r.Read()
+				}
+				if err != nil {
 					wg.Done()
 					return
 				}
 				ch <- f
 			}
-		}(i, r)
+		}(i, r, fr, gr, isFrameReader, isGroupReader)
 	}
 
 	closed := make(chan struct{})
@@ -175,6 +237,16 @@ func (s *multiTrackBlockSorter) Intercept(r []BlockReader, w []BlockWriter) {
 	buf := make([]*frameBuffer, len(r))
 	for i := range buf {
 		buf[i] = &frameBuffer{}
+	}
+
+	write := func(f *frame) {
+		if f.blockGroup {
+			if gw, ok := w[f.trackNumber].(BlockGroupWriter); ok {
+				_, _ = gw.WriteBlockGroup(f.keyframe, f.timestamp, f.duration, f.b)
+				return
+			}
+		}
+		_, _ = w[f.trackNumber].Write(f.keyframe, f.timestamp, f.b)
 	}
 
 	flush := func(all bool) {
@@ -214,8 +286,10 @@ func (s *multiTrackBlockSorter) Intercept(r []BlockReader, w []BlockWriter) {
 				(nMax > s.options.maxDelayedPackets && s.options.maxDelayedPackets != 0) ||
 				(largestTimestampDelta > s.options.maxTimescaleDelay && s.options.maxTimescaleDelay != 0) {
 				fOldest := bOldest.Pop()
-				_, _ = w[fOldest.trackNumber].Write(fOldest.keyframe, fOldest.timestamp, fOldest.b)
-				tDone = fOldest.timestamp
+				write(fOldest)
+				if fOldest.timestamp > tDone {
+					tDone = fOldest.timestamp
+				}
 			} else {
 				break
 			}
@@ -225,7 +299,11 @@ func (s *multiTrackBlockSorter) Intercept(r []BlockReader, w []BlockWriter) {
 	for {
 		select {
 		case d := <-ch:
-			if d.timestamp >= tDone || s.options.rule == BlockSorterWriteOutdated {
+			// Frames of a BlockGroup carry their own display duration and
+			// sparse event time, e.g. subtitles. They must not be dropped even
+			// when they are submitted after the interleaver has already
+			// advanced past their start time.
+			if d.blockGroup || d.timestamp >= tDone || s.options.rule == BlockSorterWriteOutdated {
 				buf[d.trackNumber].Push(d)
 				flush(false)
 			}

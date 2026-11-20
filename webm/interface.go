@@ -23,9 +23,21 @@ type BlockWriter interface {
 	mkvcore.BlockWriter
 }
 
+// BlockGroupWriter is a WebM block writer interface which can also write a
+// block with its display duration as a BlockGroup.
+type BlockGroupWriter interface {
+	mkvcore.BlockGroupWriter
+}
+
 // BlockReader is a WebM block reader interface.
 type BlockReader interface {
 	mkvcore.BlockReader
+}
+
+// BlockGroupReader is a WebM block reader interface which can also read the
+// display duration of a BlockGroup.
+type BlockGroupReader interface {
+	mkvcore.BlockGroupReader
 }
 
 // BlockCloser is a WebM closer interface.

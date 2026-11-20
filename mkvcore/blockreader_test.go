@@ -139,7 +139,10 @@ func TestBlockReader(t *testing.T) {
 											Data:        [][]byte{{0x06}},
 										},
 									},
+									// ReferencePriority doesn't make the block
+									// depend on another block.
 									ReferencePriority: 1,
+									BlockDuration:     100,
 								},
 								{
 									Block: []ebml.Block{
@@ -149,6 +152,9 @@ func TestBlockReader(t *testing.T) {
 											Data:        [][]byte{{0x07}},
 										},
 									},
+									// A block group with ReferenceBlock is not
+									// independently decodable.
+									ReferenceBlock: []int64{-30},
 								},
 							},
 						},
@@ -162,7 +168,7 @@ func TestBlockReader(t *testing.T) {
 			expected: [][]frame{
 				{
 					{keyframe: false, timestamp: 90, b: []byte{0x01, 0x02}},
-					{keyframe: true, timestamp: 130, b: []byte{0x06}},
+					{keyframe: true, timestamp: 130, b: []byte{0x06}, duration: 100},
 				},
 				{
 					{keyframe: true, timestamp: 110, b: []byte{0x03, 0x04, 0x05}},

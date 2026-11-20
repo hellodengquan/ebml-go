@@ -20,7 +20,21 @@ import (
 
 type simpleBlockGroup struct {
 	Block             []ebml.Block `ebml:"Block"`
-	ReferencePriority uint64       `ebml:"ReferencePriority"`
+	BlockDuration     uint64       `ebml:"BlockDuration,omitempty"`
+	ReferencePriority uint64       `ebml:"ReferencePriority,omitempty"`
+	// ReferenceBlock is a list of relative timestamps to the referenced
+	// blocks. A BlockGroup without ReferenceBlock can be decoded
+	// independently.
+	ReferenceBlock []int64 `ebml:"ReferenceBlock,omitempty"`
+}
+
+// blockGroupToWrite is a BlockGroup element serialized by the block writer.
+type blockGroupToWrite struct {
+	Block         ebml.Block `ebml:"Block"`
+	BlockDuration uint64     `ebml:"BlockDuration,omitempty"`
+	// ReferenceBlock must not be omitted element-wise: a zero or a negative
+	// value is a valid timestamp offset.
+	ReferenceBlock []int64 `ebml:"ReferenceBlock"`
 }
 
 type simpleBlockCluster struct {

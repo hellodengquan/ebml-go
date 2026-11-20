@@ -21,10 +21,40 @@ type BlockWriter interface {
 	Write(keyframe bool, timestamp int64, b []byte) (int, error)
 }
 
+// BlockGroupWriter is a BlockWriter which can also write a block with its
+// display duration. Blocks written through WriteBlockGroup are stored as
+// BlockGroup with BlockDuration instead of SimpleBlock.
+// This is used for sparse tracks, e.g. WebVTT subtitle tracks, whose each
+// event has its own display duration.
+type BlockGroupWriter interface {
+	BlockWriter
+	// WriteBlockGroup writes a block to the connected Matroska writer as a
+	// BlockGroup. timestamp and duration are in millisecond.
+	// A positive duration is stored as BlockDuration; duration 0 leaves
+	// BlockDuration unset. Negative duration is rejected with
+	// ErrInvalidBlockDuration.
+	// A non-keyframe block is stored with ReferenceBlock so that it is
+	// recognized as not independently decodable on reading.
+	WriteBlockGroup(keyframe bool, timestamp, duration int64, b []byte) (int, error)
+}
+
 // BlockReader is a Matroska block reader interface.
 type BlockReader interface {
 	// Read a block from the connected Matroska reader.
 	Read() (b []byte, keyframe bool, timestamp int64, err error)
+}
+
+// BlockGroupReader is a BlockReader which can also read the display duration
+// of a BlockGroup.
+type BlockGroupReader interface {
+	BlockReader
+	// ReadBlockGroup reads a block from the connected Matroska reader.
+	// duration is the BlockDuration of the BlockGroup in millisecond, or 0
+	// when the block has no BlockDuration (e.g. SimpleBlock).
+	// keyframe is true when the block can be decoded independently, i.e.
+	// SimpleBlock with its keyframe flag set or BlockGroup without
+	// ReferenceBlock.
+	ReadBlockGroup() (b []byte, keyframe bool, timestamp, duration int64, err error)
 }
 
 // BlockCloser is a Matroska closer interface.
@@ -34,15 +64,15 @@ type BlockCloser interface {
 	Close() error
 }
 
-// BlockWriteCloser groups Writer and Closer.
+// BlockWriteCloser groups Writer, BlockGroupWriter and Closer.
 type BlockWriteCloser interface {
-	BlockWriter
+	BlockGroupWriter
 	BlockCloser
 }
 
-// BlockReadCloser groups Reader and Closer.
+// BlockReadCloser groups Reader, BlockGroupReader and Closer.
 type BlockReadCloser interface {
-	BlockReader
+	BlockGroupReader
 	BlockCloser
 }
 

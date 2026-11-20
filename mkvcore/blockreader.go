@@ -34,6 +34,14 @@ func (r *blockReader) Read() (b []byte, keyframe bool, timestamp int64, err erro
 	return frame.b, frame.keyframe, frame.timestamp, nil
 }
 
+func (r *blockReader) ReadBlockGroup() (b []byte, keyframe bool, timestamp, duration int64, err error) {
+	frame, ok := <-r.f
+	if !ok {
+		return nil, false, 0, 0, io.EOF
+	}
+	return frame.b, frame.keyframe, frame.timestamp, frame.duration, nil
+}
+
 func (r *blockReader) Close() error {
 	close(r.closed)
 	return nil
@@ -44,11 +52,13 @@ func (r *blockReader) TrackEntry() TrackEntry {
 }
 
 // NewSimpleBlockReader creates BlockReadCloserWithTrackEntry for each track specified as tracks argument.
-// It reads SimpleBlock-s and BlockGroup.Block-s. Any optional data in BlockGroup are dropped.
+// It reads SimpleBlock-s and BlockGroup.Block-s.
+// BlockDuration of BlockGroup is delivered through BlockGroupReader.ReadBlockGroup;
+// Read returns the same blocks without the duration.
+// The keyframe flag of BlockGroup.Block is derived from the presence of
+// ReferenceBlock, i.e. a BlockGroup without ReferenceBlock is independently
+// decodable.
 // If you need full data, consider implementing a custom reader using ebml.Unmarshal.
-//
-// Note that, keyframe flag from BlockGroup.Block may be incorrect.
-// If you have knowledge about this, please consider fixing it.
 func NewSimpleBlockReader(r io.Reader, opts ...BlockReaderOption) ([]BlockReadCloserWithTrackEntry, error) {
 	options := &BlockReaderOptions{
 		BlockReadWriterOptions: BlockReadWriterOptions{
@@ -90,8 +100,9 @@ func NewSimpleBlockReader(r io.Reader, opts ...BlockReaderOption) ([]BlockReadCl
 	}
 
 	type blockGroup struct {
-		Block             ebml.Block
-		ReferencePriority uint64
+		Block          ebml.Block
+		BlockDuration  uint64
+		ReferenceBlock []int64
 	}
 	type clusterReader struct {
 		Timecode    chan uint64
@@ -120,6 +131,7 @@ func NewSimpleBlockReader(r io.Reader, opts ...BlockReaderOption) ([]BlockReadCl
 	L_READ:
 		for {
 			var b *ebml.Block
+			var duration uint64
 			select {
 			case tc, ok := <-timecodeCh:
 				if !ok {
@@ -149,17 +161,26 @@ func NewSimpleBlockReader(r io.Reader, opts ...BlockReaderOption) ([]BlockReadCl
 					continue
 				}
 				b = &bg.Block
-				// FIXME: This may be wrong.
-				//        ReferencePriority == 0 means that the frame is not referenced.
-				b.Keyframe = bg.ReferencePriority != 0
+				duration = bg.BlockDuration
+				// A BlockGroup with ReferenceBlock is a frame referencing
+				// other frames, i.e. not independently decodable.
+				// ReferencePriority doesn't affect decodability.
+				b.Keyframe = len(bg.ReferenceBlock) == 0
 			}
 			r := br[b.TrackNumber]
 			for l := range b.Data {
+				var frameDuration int64
+				if l == len(b.Data)-1 {
+					// BlockDuration of a laced BlockGroup is the duration of
+					// its last frame.
+					frameDuration = int64(duration)
+				}
 				frame := &frame{
 					trackNumber: b.TrackNumber,
 					keyframe:    b.Keyframe,
 					timestamp:   int64(timecode) + int64(b.Timecode),
 					b:           b.Data[l],
+					duration:    frameDuration,
 				}
 				select {
 				case r.f <- frame:

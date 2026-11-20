@@ -30,26 +30,26 @@ func TestMultiTrackBlockSorterMaxPackets(t *testing.T) {
 		"DropOutdated": {
 			BlockSorterDropOutdated,
 			[]frame{
-				{1, false, 9, []byte{3}},
-				{0, false, 10, []byte{1}},
-				{0, false, 11, []byte{2}},
-				{0, false, 16, []byte{4}},
-				{0, false, 17, []byte{5}},
-				{0, false, 18, []byte{6}},
-				{1, false, 18, []byte{8}},
+				{trackNumber: 1, keyframe: false, timestamp: 9, b: []byte{3}},
+				{trackNumber: 0, keyframe: false, timestamp: 10, b: []byte{1}},
+				{trackNumber: 0, keyframe: false, timestamp: 11, b: []byte{2}},
+				{trackNumber: 0, keyframe: false, timestamp: 16, b: []byte{4}},
+				{trackNumber: 0, keyframe: false, timestamp: 17, b: []byte{5}},
+				{trackNumber: 0, keyframe: false, timestamp: 18, b: []byte{6}},
+				{trackNumber: 1, keyframe: false, timestamp: 18, b: []byte{8}},
 			},
 		},
 		"WriteOutdated": {
 			BlockSorterWriteOutdated,
 			[]frame{
-				{1, false, 9, []byte{3}},
-				{0, false, 10, []byte{1}},
-				{0, false, 11, []byte{2}},
-				{0, false, 16, []byte{4}},
-				{1, false, 15, []byte{7}},
-				{0, false, 17, []byte{5}},
-				{0, false, 18, []byte{6}},
-				{1, false, 18, []byte{8}},
+				{trackNumber: 1, keyframe: false, timestamp: 9, b: []byte{3}},
+				{trackNumber: 0, keyframe: false, timestamp: 10, b: []byte{1}},
+				{trackNumber: 0, keyframe: false, timestamp: 11, b: []byte{2}},
+				{trackNumber: 0, keyframe: false, timestamp: 16, b: []byte{4}},
+				{trackNumber: 1, keyframe: false, timestamp: 15, b: []byte{7}},
+				{trackNumber: 0, keyframe: false, timestamp: 17, b: []byte{5}},
+				{trackNumber: 0, keyframe: false, timestamp: 18, b: []byte{6}},
+				{trackNumber: 1, keyframe: false, timestamp: 18, b: []byte{8}},
 			},
 		},
 	} {
@@ -86,17 +86,17 @@ func TestMultiTrackBlockSorterMaxPackets(t *testing.T) {
 			}()
 
 			go func() {
-				ch[0] <- &frame{0, false, 10, []byte{1}}
-				ch[0] <- &frame{0, false, 11, []byte{2}}
+				ch[0] <- &frame{trackNumber: 0, keyframe: false, timestamp: 10, b: []byte{1}}
+				ch[0] <- &frame{trackNumber: 0, keyframe: false, timestamp: 11, b: []byte{2}}
 				time.Sleep(time.Millisecond)
-				ch[1] <- &frame{1, false, 9, []byte{3}}
+				ch[1] <- &frame{trackNumber: 1, keyframe: false, timestamp: 9, b: []byte{3}}
 				time.Sleep(time.Millisecond)
-				ch[0] <- &frame{0, false, 16, []byte{4}}
-				ch[0] <- &frame{0, false, 17, []byte{5}}
-				ch[0] <- &frame{0, false, 18, []byte{6}}
+				ch[0] <- &frame{trackNumber: 0, keyframe: false, timestamp: 16, b: []byte{4}}
+				ch[0] <- &frame{trackNumber: 0, keyframe: false, timestamp: 17, b: []byte{5}}
+				ch[0] <- &frame{trackNumber: 0, keyframe: false, timestamp: 18, b: []byte{6}}
 				time.Sleep(time.Millisecond)
-				ch[1] <- &frame{1, false, 15, []byte{7}} // drop due to maxDelay=2
-				ch[1] <- &frame{1, false, 18, []byte{8}}
+				ch[1] <- &frame{trackNumber: 1, keyframe: false, timestamp: 15, b: []byte{7}} // drop due to maxDelay=2
+				ch[1] <- &frame{trackNumber: 1, keyframe: false, timestamp: 18, b: []byte{8}}
 				close(ch[0])
 				close(ch[1])
 			}()
@@ -121,26 +121,26 @@ func TestMultiTrackBlockSorterTimescale(t *testing.T) {
 		"DropOutdated": {
 			BlockSorterDropOutdated,
 			[]frame{
-				{0, false, 100, []byte{1}},
-				{0, false, 110, []byte{2}},
-				{1, false, 150, []byte{3}},
-				{0, false, 160, []byte{4}},
-				{0, false, 170, []byte{5}},
-				{0, false, 200, []byte{6}},
-				{1, false, 210, []byte{8}},
+				{trackNumber: 0, keyframe: false, timestamp: 100, b: []byte{1}},
+				{trackNumber: 0, keyframe: false, timestamp: 110, b: []byte{2}},
+				{trackNumber: 1, keyframe: false, timestamp: 150, b: []byte{3}},
+				{trackNumber: 0, keyframe: false, timestamp: 160, b: []byte{4}},
+				{trackNumber: 0, keyframe: false, timestamp: 170, b: []byte{5}},
+				{trackNumber: 0, keyframe: false, timestamp: 200, b: []byte{6}},
+				{trackNumber: 1, keyframe: false, timestamp: 210, b: []byte{8}},
 			},
 		},
 		"WriteOutdated": {
 			BlockSorterWriteOutdated,
 			[]frame{
-				{0, false, 100, []byte{1}},
-				{0, false, 110, []byte{2}},
-				{1, false, 150, []byte{3}},
-				{1, false, 90, []byte{7}},
-				{0, false, 160, []byte{4}},
-				{0, false, 170, []byte{5}},
-				{0, false, 200, []byte{6}},
-				{1, false, 210, []byte{8}},
+				{trackNumber: 0, keyframe: false, timestamp: 100, b: []byte{1}},
+				{trackNumber: 0, keyframe: false, timestamp: 110, b: []byte{2}},
+				{trackNumber: 1, keyframe: false, timestamp: 150, b: []byte{3}},
+				{trackNumber: 1, keyframe: false, timestamp: 90, b: []byte{7}},
+				{trackNumber: 0, keyframe: false, timestamp: 160, b: []byte{4}},
+				{trackNumber: 0, keyframe: false, timestamp: 170, b: []byte{5}},
+				{trackNumber: 0, keyframe: false, timestamp: 200, b: []byte{6}},
+				{trackNumber: 1, keyframe: false, timestamp: 210, b: []byte{8}},
 			},
 		},
 	} {
@@ -177,17 +177,17 @@ func TestMultiTrackBlockSorterTimescale(t *testing.T) {
 			}()
 
 			go func() {
-				ch[0] <- &frame{0, false, 100, []byte{1}}
-				ch[0] <- &frame{0, false, 110, []byte{2}}
+				ch[0] <- &frame{trackNumber: 0, keyframe: false, timestamp: 100, b: []byte{1}}
+				ch[0] <- &frame{trackNumber: 0, keyframe: false, timestamp: 110, b: []byte{2}}
 				time.Sleep(time.Millisecond)
-				ch[1] <- &frame{1, false, 150, []byte{3}}
+				ch[1] <- &frame{trackNumber: 1, keyframe: false, timestamp: 150, b: []byte{3}}
 				time.Sleep(time.Millisecond)
-				ch[0] <- &frame{0, false, 160, []byte{4}}
-				ch[0] <- &frame{0, false, 170, []byte{5}}
-				ch[0] <- &frame{0, false, 200, []byte{6}}
+				ch[0] <- &frame{trackNumber: 0, keyframe: false, timestamp: 160, b: []byte{4}}
+				ch[0] <- &frame{trackNumber: 0, keyframe: false, timestamp: 170, b: []byte{5}}
+				ch[0] <- &frame{trackNumber: 0, keyframe: false, timestamp: 200, b: []byte{6}}
 				time.Sleep(time.Millisecond)
-				ch[1] <- &frame{1, false, 90, []byte{7}} // maybe dropped due to WithMaxTimescaleDelay=100
-				ch[1] <- &frame{1, false, 210, []byte{8}}
+				ch[1] <- &frame{trackNumber: 1, keyframe: false, timestamp: 90, b: []byte{7}} // maybe dropped due to WithMaxTimescaleDelay=100
+				ch[1] <- &frame{trackNumber: 1, keyframe: false, timestamp: 210, b: []byte{8}}
 				close(ch[0])
 				close(ch[1])
 			}()
@@ -234,8 +234,8 @@ func BenchmarkMultiTrackBlockSorter(b *testing.B) {
 
 	go func() {
 		for i := 0; i < b.N; i++ {
-			ch[0] <- &frame{0, false, int64(i), []byte{1, 2, 3, 4}}
-			ch[1] <- &frame{1, false, int64(i) + 5, []byte{2, 3, 4, 5}}
+			ch[0] <- &frame{trackNumber: 0, keyframe: false, timestamp: int64(i), b: []byte{1, 2, 3, 4}}
+			ch[1] <- &frame{trackNumber: 1, keyframe: false, timestamp: int64(i) + 5, b: []byte{2, 3, 4, 5}}
 		}
 		close(ch[0])
 		close(ch[1])

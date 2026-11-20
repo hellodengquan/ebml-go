@@ -28,6 +28,9 @@ import (
 // ErrIgnoreOldFrame means that a frame has too old timestamp and ignored.
 var ErrIgnoreOldFrame = errors.New("too old frame")
 
+// ErrInvalidBlockDuration means that a negative block duration is passed to WriteBlockGroup.
+var ErrInvalidBlockDuration = errors.New("invalid block duration")
+
 type blockWriter struct {
 	trackNumber uint64
 	f           chan *frame
@@ -40,6 +43,12 @@ type frame struct {
 	keyframe    bool
 	timestamp   int64
 	b           []byte
+	// duration is the display duration of a BlockGroup in millisecond.
+	// duration is meaningful only when blockGroup is true.
+	duration int64
+	// blockGroup is true when the frame must be written as a BlockGroup
+	// instead of a SimpleBlock.
+	blockGroup bool
 }
 
 func (w *blockWriter) Write(keyframe bool, timestamp int64, b []byte) (int, error) {
@@ -48,6 +57,21 @@ func (w *blockWriter) Write(keyframe bool, timestamp int64, b []byte) (int, erro
 		keyframe:    keyframe,
 		timestamp:   timestamp,
 		b:           b,
+	}
+	return len(b), nil
+}
+
+func (w *blockWriter) WriteBlockGroup(keyframe bool, timestamp, duration int64, b []byte) (int, error) {
+	if duration < 0 {
+		return 0, ErrInvalidBlockDuration
+	}
+	w.f <- &frame{
+		trackNumber: w.trackNumber,
+		keyframe:    keyframe,
+		timestamp:   timestamp,
+		b:           b,
+		duration:    duration,
+		blockGroup:  true,
 	}
 	return len(b), nil
 }
@@ -68,9 +92,16 @@ type TrackDescription struct {
 }
 
 // NewSimpleBlockWriter creates BlockWriteCloser for each track specified as tracks argument.
-// Blocks will be written to the writer as EBML SimpleBlocks.
+// Blocks written by BlockWriteCloser.Write will be written to the writer as EBML SimpleBlocks.
+// Blocks written by BlockWriteCloser.WriteBlockGroup will be written as EBML
+// BlockGroups with BlockDuration, which is used for tracks whose each block has
+// its own display duration, e.g. WebVTT subtitle tracks.
 // Given io.WriteCloser will be closed automatically; don't close it by yourself.
 // Frames written to each track must be sorted by their timestamp.
+//
+// A custom BlockInterceptor registered by WithBlockInterceptor must propagate
+// BlockGroupReader/BlockGroupWriter when the reader/writer implements them,
+// otherwise BlockGroup blocks lose their duration and type information.
 func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...BlockWriterOption) ([]BlockWriteCloser, error) {
 	options := &BlockWriterOptions{
 		BlockReadWriterOptions: BlockReadWriterOptions{
@@ -268,25 +299,47 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 				if tc0 == invalidTimestamp {
 					tc0 = f.timestamp
 				}
-				lastTc = f.timestamp
+				if f.blockGroup {
+					// A sparse track, e.g. subtitles, can be written after the
+					// interleaver has advanced past its timestamp. The stream
+					// duration must not go backwards in that case.
+					if f.timestamp > lastTc {
+						lastTc = f.timestamp
+					}
+				} else {
+					lastTc = f.timestamp
+				}
 				tc := f.timestamp - tc1
-				if tc1 == invalidTimestamp ||
+				newCluster := tc1 == invalidTimestamp ||
 					tc >= options.maxClusterDuration ||
-					(f.trackNumber == options.mainTrackNumber && tc >= options.minClusterDuration && f.keyframe) {
+					(f.trackNumber == options.mainTrackNumber && tc >= options.minClusterDuration && f.keyframe)
+				// A sparse event, e.g. a subtitle, may arrive after the stream
+				// has already moved far ahead. Its relative timecode can't be
+				// represented in the current cluster, so start a new cluster to
+				// keep the event and its start time instead of dropping it.
+				lateEvent := !newCluster && f.blockGroup && tc <= -0x7FFF && f.timestamp >= tc0
+				if newCluster || lateEvent {
 					// Create new Cluster
 					tc1 = f.timestamp
 					tc = 0
 
-					// Collect CuePoint before Clear
+					// Collect CuePoint before Clear.
+					// A cluster created for a late event is placed after
+					// clusters with newer timecodes. CueTime must be
+					// monotonically increasing, so skip such clusters and any
+					// cluster starting before the last cue.
 					if options.cuesReservedSize > 0 {
 						runningPos += uint64(w.Size())
-						cuePoints = append(cuePoints, cuePoint{
-							CueTime: uint64(tc1 - tc0),
-							CueTrackPositions: []cueTrackPosition{{
-								CueTrack:           f.trackNumber,
-								CueClusterPosition: runningPos - segmentDataStart,
-							}},
-						})
+						if !lateEvent &&
+							(len(cuePoints) == 0 || uint64(tc1-tc0) > cuePoints[len(cuePoints)-1].CueTime) {
+							cuePoints = append(cuePoints, cuePoint{
+								CueTime: uint64(tc1 - tc0),
+								CueTrackPositions: []cueTrackPosition{{
+									CueTrack:           f.trackNumber,
+									CueClusterPosition: runningPos - segmentDataStart,
+								}},
+							})
+						}
 					}
 
 					cluster := struct {
@@ -313,15 +366,43 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 					continue
 				}
 
+				block := ebml.Block{
+					TrackNumber: f.trackNumber,
+					Timecode:    int16(tc),
+					Keyframe:    f.keyframe,
+					Data:        [][]byte{f.b},
+				}
+				if f.blockGroup {
+					// Write BlockGroup to the file
+					var referenceBlock []int64
+					if !f.keyframe {
+						// A BlockGroup without ReferenceBlock means that the
+						// block can be decoded independently. Reference the
+						// preceding block to mark it as a dependent frame.
+						referenceBlock = []int64{-1}
+					}
+					bg := struct {
+						BlockGroup blockGroupToWrite `ebml:"BlockGroup"`
+					}{
+						blockGroupToWrite{
+							Block:          block,
+							BlockDuration:  uint64(f.duration), // duration is non-negative
+							ReferenceBlock: referenceBlock,
+						},
+					}
+					if err := ebml.Marshal(&bg, w, options.marshalOpts...); err != nil {
+						if options.onFatal != nil {
+							options.onFatal(err)
+						}
+						return
+					}
+					continue
+				}
+
 				b := struct {
 					Block ebml.Block `ebml:"SimpleBlock"`
 				}{
-					ebml.Block{
-						TrackNumber: f.trackNumber,
-						Timecode:    int16(tc),
-						Keyframe:    f.keyframe,
-						Data:        [][]byte{f.b},
-					},
+					block,
 				}
 				// Write SimpleBlock to the file
 				if err := ebml.Marshal(&b, w, options.marshalOpts...); err != nil {
