@@ -40,3 +40,9 @@ type Info struct {
 	Duration      float64   `ebml:"Duration,omitempty"`
 	DateUTC       time.Time `ebml:"DateUTC,omitempty"`
 }
+
+// SetDuration sets the Duration field.
+// This implements the mkvcore durationSettable interface, allowing the
+// library to automatically write Duration when the output supports
+// random access.
+func (i *Info) SetDuration(d float64) { i.Duration = d }

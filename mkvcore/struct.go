@@ -33,6 +33,9 @@ type simpleBlockCluster struct {
 type cueTrackPosition struct {
 	CueTrack           uint64 `ebml:"CueTrack"`
 	CueClusterPosition uint64 `ebml:"CueClusterPosition"`
+	// CueBlockNumber is the 1-based index of the block in the cluster.
+	// The EBML default is 1, so it is left zero (omitted) for the first block.
+	CueBlockNumber uint64 `ebml:"CueBlockNumber,omitempty"`
 }
 
 type cuePoint struct {

@@ -35,6 +35,9 @@ var ErrCuesReservedTooSmall = errors.New("WithCues reservedSize must be at least
 // ErrDurationInClusterOutOfRange means that a duration is not in the valid range. Duration in a cluster must be between 0 and 0x7FFF.
 var ErrDurationInClusterOutOfRange = errors.New("duration in cluster out of range")
 
+// ErrInvalidHeader means that the marshaled EBML header could not be parsed.
+var ErrInvalidHeader = errors.New("failed to parse marshaled EBML header")
+
 // durationSettable is implemented by segment info types that support
 // having their Duration field set automatically (e.g. webm.Info).
 type durationSettable interface {
@@ -154,6 +157,17 @@ func WithBlockInterceptor(interceptor BlockInterceptor) BlockWriterOptionFn {
 // reservedSize is the number of bytes (>=9) to reserve at the front of the file for Cues.
 // Requires WithSeekHead(true) and an io.WriteSeeker or io.WriterAt, not just io.WriteCloser.
 // If the index space is underallocated, Cues data is downsampled to fit the space.
+//
+// When a video track is present, CuePoints reference its keyframes (including
+// those in the middle of a Cluster) so that seeking lands on a decodable
+// frame. For audio-only recordings, where there is no keyframe, a CuePoint is
+// written for the first frame of each Cluster and Clusters are split
+// periodically unless a cluster duration is configured explicitly.
+//
+// The Duration of the recording is written into the header whenever the
+// output supports random access and the segment info type implements
+// SetDuration. The caller-provided segment info is not modified, so the same
+// configuration can be reused for another recording.
 func WithCues(reservedSize int) BlockWriterOptionFn {
 	return func(o *BlockWriterOptions) error {
 		if reservedSize < 9 {

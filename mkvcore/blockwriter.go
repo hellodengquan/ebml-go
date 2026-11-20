@@ -91,22 +91,57 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 		}
 	}
 
-	// Validate Cues requirements
+	// Resolve a random-access writer. Cues require one; a plain recording uses
+	// it opportunistically to fill in the header Duration at finalization.
 	var writerAt io.WriterAt
+	{
+		writerAt, _ = w0.(io.WriterAt)
+		if writerAt == nil {
+			if seeker, ok := w0.(io.WriteSeeker); ok {
+				writerAt = &writerAtBySeeker{
+					WriteSeeker: seeker,
+				}
+			}
+		}
+	}
 	if options.cuesReservedSize > 0 {
 		if !options.seekHead {
 			return nil, ErrCuesRequiresSeekHead
 		}
-		var ok bool
-		writerAt, ok = w0.(io.WriterAt)
-		if !ok {
-			seeker, ok := w0.(io.WriteSeeker)
-			if !ok {
-				return nil, ErrCuesRequiresSeeker
-			}
-			writerAt = &writerAtBySeeker{
-				WriteSeeker: seeker,
-			}
+		if writerAt == nil {
+			return nil, ErrCuesRequiresSeeker
+		}
+	}
+
+	// Select the track referenced by the Cues. Video recordings are indexed on
+	// the keyframes of the main track; audio-only recordings are indexed
+	// periodically so that seeking is possible even without keyframes.
+	var cueTrack uint64
+	var cueRequireKeyframe bool
+	if options.cuesReservedSize > 0 {
+		cueTrack, cueRequireKeyframe = selectCueTrack(tracks, options.mainTrackNumber)
+		if !cueRequireKeyframe &&
+			options.mainTrackNumber == 0 && options.maxClusterDuration == 0x7FFF {
+			// Audio has no keyframes, and a single Cluster would leave the
+			// Cues with only one entry. Split Clusters periodically to create
+			// regularly spaced seek points, unless the caller configured the
+			// Cluster cadence explicitly.
+			options.maxClusterDuration = defaultAudioClusterDuration(options.segmentInfo)
+		}
+	}
+
+	// Write Duration into the header when the output is seekable and the
+	// segment info type supports it. The placeholder is set on a copy so that
+	// the caller-owned configuration is not modified and can be reused for
+	// another recording.
+	segmentInfo := options.segmentInfo
+	autoDuration := false
+	if writerAt != nil {
+		if _, ok := segmentInfo.(durationSettable); ok {
+			cloned := cloneSegmentInfo(segmentInfo)
+			cloned.(durationSettable).SetDuration(math.SmallestNonzeroFloat64)
+			segmentInfo = cloned
+			autoDuration = true
 		}
 	}
 
@@ -115,32 +150,19 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 	header := flexHeader{
 		Header: options.ebmlHeader,
 		Segment: flexSegment{
-			Info: options.segmentInfo,
+			Info: segmentInfo,
 		},
 	}
 	for _, t := range tracks {
 		header.Segment.Tracks.TrackEntry = append(header.Segment.Tracks.TrackEntry, t.TrackEntry)
 	}
 
-	// When Cues are enabled and segmentInfo supports it, set a placeholder
-	// Duration so the marshaler includes the element in the output.
-	// We'll overwrite it with the real value at finalization.
-	if options.cuesReservedSize > 0 {
-		if ds, ok := options.segmentInfo.(durationSettable); ok {
-			ds.SetDuration(math.SmallestNonzeroFloat64)
-		}
+	headerBytes, segmentDataStart, durationDataPos, err := buildHeader(
+		&header, options.seekHead, options.cuesReservedSize > 0, options.marshalOpts...)
+	if err != nil {
+		return nil, err
 	}
-
-	var durationElementPos uint64
-	var segmentDataStart uint64
-	if options.seekHead {
-		var err error
-		segmentDataStart, durationElementPos, err = setSeekHead(&header, options.cuesReservedSize > 0, options.marshalOpts...)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if err := ebml.Marshal(&header, w, options.marshalOpts...); err != nil {
+	if _, err := w.Write(headerBytes); err != nil {
 		return nil, err
 	}
 
@@ -212,6 +234,13 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 		// Cues tracking state
 		runningPos := posAfterHeader
 		var cuePoints []cuePoint
+		// Index of the next block written to the current Cluster,
+		// counted from 1 as defined by CueBlockNumber.
+		blockNumber := uint64(0)
+		// Whether the current Cluster already has a CuePoint. Used for
+		// audio-only recordings, where only the first cue track block of a
+		// Cluster is indexed.
+		cueAddedForCluster := false
 
 		defer func() {
 			// Finalize WebM
@@ -243,12 +272,14 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 			}
 
 			// Overwrite the placeholder Duration with the real value.
-			// Duration element layout: 2-byte ID (0x44 0x89) + 1-byte VINT (0x88) + 8-byte float64.
-			if durationElementPos > 0 && writerAt != nil {
+			if autoDuration && writerAt != nil && durationDataPos >= 0 {
 				duration := float64(lastTc - tc0)
+				if duration < 0 {
+					duration = 0
+				}
 				var buf [8]byte
 				binary.BigEndian.PutUint64(buf[:], math.Float64bits(duration))
-				if _, err := writerAt.WriteAt(buf[:], int64(durationElementPos)+3); err != nil {
+				if _, err := writerAt.WriteAt(buf[:], int64(durationDataPos)); err != nil {
 					if options.onFatal != nil {
 						options.onFatal(err)
 					}
@@ -268,7 +299,6 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 				if tc0 == invalidTimestamp {
 					tc0 = f.timestamp
 				}
-				lastTc = f.timestamp
 				tc := f.timestamp - tc1
 				if tc1 == invalidTimestamp ||
 					tc >= options.maxClusterDuration ||
@@ -277,17 +307,9 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 					tc1 = f.timestamp
 					tc = 0
 
-					// Collect CuePoint before Clear
-					if options.cuesReservedSize > 0 {
-						runningPos += uint64(w.Size())
-						cuePoints = append(cuePoints, cuePoint{
-							CueTime: uint64(tc1 - tc0),
-							CueTrackPositions: []cueTrackPosition{{
-								CueTrack:           f.trackNumber,
-								CueClusterPosition: runningPos - segmentDataStart,
-							}},
-						})
-					}
+					runningPos += uint64(w.Size())
+					blockNumber = 0
+					cueAddedForCluster = false
 
 					cluster := struct {
 						Cluster simpleBlockCluster `ebml:"Cluster,size=unknown"`
@@ -311,6 +333,49 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 						options.onError(ErrIgnoreOldFrame)
 					}
 					continue
+				}
+				// Track the end of the media for the header Duration and for the
+				// final empty Cluster. Out-of-order frames were rejected above.
+				if f.timestamp > lastTc {
+					lastTc = f.timestamp
+				}
+				blockNumber++
+
+				// Record a CuePoint for every entry point of the cue track:
+				// each keyframe for video (even mid-Cluster), or the first cue
+				// track block of each Cluster for audio-only recordings. Each
+				// CuePoint carries the Cluster position and the 1-based block
+				// number, so a player lands exactly on the referenced frame.
+				if options.cuesReservedSize > 0 && f.trackNumber == cueTrack && !cueAddedForCluster {
+					var addCue bool
+					if cueRequireKeyframe {
+						addCue = f.keyframe
+					} else {
+						addCue = true
+					}
+					if addCue {
+						cueTime := tc1 - tc0 + tc
+						if cueTime < 0 {
+							cueTime = 0
+						}
+						cueBlockNumber := blockNumber
+						if cueBlockNumber == 1 {
+							// The EBML default is 1; omit it to save space.
+							cueBlockNumber = 0
+						}
+						cuePoints = append(cuePoints, cuePoint{
+							CueTime: uint64(cueTime),
+							CueTrackPositions: []cueTrackPosition{{
+								CueTrack:           f.trackNumber,
+								CueClusterPosition: runningPos - segmentDataStart,
+								CueBlockNumber:     cueBlockNumber,
+							}},
+						})
+						if !cueRequireKeyframe {
+							// Audio-only: one index per Cluster.
+							cueAddedForCluster = true
+						}
+					}
 				}
 
 				b := struct {
