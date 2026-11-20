@@ -106,6 +106,16 @@ type BlockWriterOptions struct {
 	cuesReservedSize   int
 	minClusterDuration int64
 	maxClusterDuration int64
+	lacingTracks       map[uint64]bool
+	lacingAllTracks    bool
+}
+
+// lacingEnabled reports whether frame packing (lacing) is enabled for the track.
+func (o *BlockWriterOptions) lacingEnabled(trackNumber uint64) bool {
+	if o.lacingAllTracks {
+		return true
+	}
+	return o.lacingTracks[trackNumber]
 }
 
 // WithEBMLHeader sets EBML header.
@@ -202,6 +212,40 @@ func WithMinMaxClusterDuration(mainTrackNumber uint64, minDuration, maxDuration 
 		o.mainTrackNumber = mainTrackNumber
 		o.minClusterDuration = minDuration
 		o.maxClusterDuration = maxDuration
+		return nil
+	}
+}
+
+// WithLacing enables frame packing (lacing) on the given tracks.
+// Consecutive frames of a track whose timestamp difference equals the track's
+// DefaultDuration are packed into one block and the smallest lacing
+// representation (Xiph, EBML or fixed-size) is selected automatically.
+// Frames are split among blocks when they are not consecutive, when the
+// keyframe flag changes, or when a new cluster starts.
+//
+// The TrackEntry must have DefaultDuration set; frame packing is not applied
+// to tracks without it.
+// The track number 0 is ignored.
+func WithLacing(trackNumbers ...uint64) BlockWriterOptionFn {
+	return func(o *BlockWriterOptions) error {
+		for _, t := range trackNumbers {
+			if t == 0 {
+				continue
+			}
+			if o.lacingTracks == nil {
+				o.lacingTracks = make(map[uint64]bool)
+			}
+			o.lacingTracks[t] = true
+		}
+		return nil
+	}
+}
+
+// WithLacingAllTracks enables frame packing (lacing) on all tracks.
+// See WithLacing for details.
+func WithLacingAllTracks() BlockWriterOptionFn {
+	return func(o *BlockWriterOptions) error {
+		o.lacingAllTracks = true
 		return nil
 	}
 }

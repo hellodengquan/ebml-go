@@ -48,6 +48,22 @@ func TestUnlacer(t *testing.T) {
 			frames:     [][]byte{},
 			err:        io.ErrUnexpectedEOF,
 		},
+		"XiphMultipleOf255": {
+			newUnlacer: NewXiphUnlacer,
+			header: []byte{
+				0x03,
+				0xFF, 0x00, // 255 bytes
+				0xFF, 0xFF, 0x00, // 510 bytes
+				0x00, // 0 bytes
+			},
+			frames: [][]byte{
+				bytes.Repeat([]byte{0xAA}, 255),
+				bytes.Repeat([]byte{0xCC}, 510),
+				bytes.Repeat([]byte{0x55}, 0),
+				bytes.Repeat([]byte{0x33}, 40),
+			},
+			err: nil,
+		},
 		"XiphShort": {
 			newUnlacer: NewXiphUnlacer,
 			header: []byte{

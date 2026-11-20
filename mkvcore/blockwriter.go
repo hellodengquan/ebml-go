@@ -71,6 +71,8 @@ type TrackDescription struct {
 // Blocks will be written to the writer as EBML SimpleBlocks.
 // Given io.WriteCloser will be closed automatically; don't close it by yourself.
 // Frames written to each track must be sorted by their timestamp.
+//
+// Use WithLacing to pack consecutive frames of a track into one block.
 func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...BlockWriterOption) ([]BlockWriteCloser, error) {
 	options := &BlockWriterOptions{
 		BlockReadWriterOptions: BlockReadWriterOptions{
@@ -213,7 +215,63 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 		runningPos := posAfterHeader
 		var cuePoints []cuePoint
 
+		// Lacing state. A track entry is present only when frame packing is
+		// enabled and its frame duration can be represented in the timecode scale.
+		lacingDurations := make(map[uint64]int64)
+		timecodeScale := segmentTimecodeScale(options.segmentInfo)
+		for _, t := range tracks {
+			if !options.lacingEnabled(t.TrackNumber) {
+				continue
+			}
+			if ticks := laceFrameDurationTicks(trackDefaultDuration(t.TrackEntry), timecodeScale); ticks > 0 {
+				lacingDurations[t.TrackNumber] = ticks
+			}
+		}
+		pending := make(map[uint64]*pendingLace)
+
+		writeBlock := func(b *ebml.Block) bool {
+			blk := struct {
+				Block ebml.Block `ebml:"SimpleBlock"`
+			}{
+				Block: *b,
+			}
+			if err := ebml.Marshal(&blk, w, options.marshalOpts...); err != nil {
+				if options.onFatal != nil {
+					options.onFatal(err)
+				}
+				return false
+			}
+			return true
+		}
+
+		// flushLace writes the frames accumulated for the track as one block.
+		flushLace := func(trackNumber uint64) bool {
+			p := pending[trackNumber]
+			if p == nil {
+				return true
+			}
+			delete(pending, trackNumber)
+			return writeBlock(&ebml.Block{
+				TrackNumber: p.trackNumber,
+				Timecode:    p.timecode,
+				Keyframe:    p.keyframe,
+				Lacing:      selectLacingMode(p.frames),
+				Data:        p.frames,
+			})
+		}
+		flushAllLace := func() bool {
+			for _, t := range tracks {
+				if !flushLace(t.TrackNumber) {
+					return false
+				}
+			}
+			return true
+		}
+
 		defer func() {
+			// Flush the frames still pending before closing the last cluster.
+			flushAllLace()
+
 			// Finalize WebM
 			if tc0 == invalidTimestamp {
 				// No data written
@@ -273,6 +331,12 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 				if tc1 == invalidTimestamp ||
 					tc >= options.maxClusterDuration ||
 					(f.trackNumber == options.mainTrackNumber && tc >= options.minClusterDuration && f.keyframe) {
+					// Flush pending laced frames into the previous cluster before
+					// starting the new one.
+					if !flushAllLace() {
+						return
+					}
+
 					// Create new Cluster
 					tc1 = f.timestamp
 					tc = 0
@@ -313,21 +377,38 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 					continue
 				}
 
-				b := struct {
-					Block ebml.Block `ebml:"SimpleBlock"`
-				}{
-					ebml.Block{
-						TrackNumber: f.trackNumber,
-						Timecode:    int16(tc),
-						Keyframe:    f.keyframe,
-						Data:        [][]byte{f.b},
-					},
-				}
-				// Write SimpleBlock to the file
-				if err := ebml.Marshal(&b, w, options.marshalOpts...); err != nil {
-					if options.onFatal != nil {
-						options.onFatal(err)
+				if ticks, ok := lacingDurations[f.trackNumber]; ok {
+					p := pending[f.trackNumber]
+					if p != nil &&
+						(len(p.frames) >= maxLacedFrames ||
+							f.timestamp-p.lastTs != ticks ||
+							f.keyframe != p.keyframe) {
+						// The frame cannot be packed with the pending ones.
+						if !flushLace(f.trackNumber) {
+							return
+						}
+						p = nil
 					}
+					if p == nil {
+						p = &pendingLace{
+							trackNumber: f.trackNumber,
+							timecode:    int16(tc),
+							keyframe:    f.keyframe,
+						}
+						pending[f.trackNumber] = p
+					}
+					p.frames = append(p.frames, f.b)
+					p.lastTs = f.timestamp
+					continue
+				}
+
+				// Write SimpleBlock to the file
+				if !writeBlock(&ebml.Block{
+					TrackNumber: f.trackNumber,
+					Timecode:    int16(tc),
+					Keyframe:    f.keyframe,
+					Data:        [][]byte{f.b},
+				}) {
 					return
 				}
 			}

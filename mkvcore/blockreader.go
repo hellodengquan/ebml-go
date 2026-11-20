@@ -65,6 +65,7 @@ func NewSimpleBlockReader(r io.Reader, opts ...BlockReaderOption) ([]BlockReadCl
 
 	var header struct {
 		Segment struct {
+			Info   map[string]interface{} `ebml:"Info"`
 			Tracks struct {
 				TrackEntry []TrackEntry
 			} `ebml:"Tracks,stop"`
@@ -74,6 +75,17 @@ func NewSimpleBlockReader(r io.Reader, opts ...BlockReaderOption) ([]BlockReadCl
 	case ebml.ErrReadStopped:
 	default:
 		return nil, err
+	}
+
+	// Timecode of the frames following the first one in a laced block is
+	// derived from the track's DefaultDuration converted to the segment
+	// timecode scale.
+	timecodeScale := segmentTimecodeScale(header.Segment.Info)
+	frameDurations := make(map[uint64]int64)
+	for _, t := range header.Segment.Tracks.TrackEntry {
+		if ticks := laceFrameDurationTicks(trackDefaultDuration(t), timecodeScale); ticks > 0 {
+			frameDurations[t.TrackNumber] = ticks
+		}
 	}
 
 	var ws []BlockReadCloserWithTrackEntry
@@ -154,11 +166,18 @@ func NewSimpleBlockReader(r io.Reader, opts ...BlockReaderOption) ([]BlockReadCl
 				b.Keyframe = bg.ReferencePriority != 0
 			}
 			r := br[b.TrackNumber]
+			// Frames in a laced block share the block timecode; the play time
+			// of each following frame is derived from the track's frame duration.
+			frameDuration := frameDurations[b.TrackNumber]
 			for l := range b.Data {
+				timestamp := int64(timecode) + int64(b.Timecode)
+				if b.Lacing != ebml.LacingNo && frameDuration > 0 {
+					timestamp += int64(l) * frameDuration
+				}
 				frame := &frame{
 					trackNumber: b.TrackNumber,
 					keyframe:    b.Keyframe,
-					timestamp:   int64(timecode) + int64(b.Timecode),
+					timestamp:   timestamp,
 					b:           b.Data[l],
 				}
 				select {

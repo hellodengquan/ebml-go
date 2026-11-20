@@ -66,6 +66,30 @@ func TestLacer(t *testing.T) {
 			b:        []byte{},
 			err:      nil,
 		},
+		"XiphMultipleOf255": {
+			newLacer: NewXiphLacer,
+			frames: [][]byte{
+				bytes.Repeat([]byte{0xAA}, 255),
+				bytes.Repeat([]byte{0xCC}, 510),
+				bytes.Repeat([]byte{0x55}, 0),
+				bytes.Repeat([]byte{0x33}, 40),
+			},
+			b: append(
+				[]byte{
+					0x03,
+					0xFF, 0x00, // 255 bytes
+					0xFF, 0xFF, 0x00, // 510 bytes
+					0x00, // 0 bytes
+				},
+				bytes.Join(
+					[][]byte{
+						bytes.Repeat([]byte{0xAA}, 255),
+						bytes.Repeat([]byte{0xCC}, 510),
+						bytes.Repeat([]byte{0x55}, 0),
+						bytes.Repeat([]byte{0x33}, 40),
+					}, []byte{})...),
+			err: nil,
+		},
 		"XiphTooLong": {
 			newLacer: NewXiphLacer,
 			frames:   make([][]byte, 256),

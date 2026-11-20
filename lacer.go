@@ -66,9 +66,11 @@ func (l *xiphLacer) Write(b [][]byte) error {
 	size := []byte{byte(nFrames - 1)}
 	for i := 0; i < nFrames-1; i++ {
 		n := len(b[i])
-		for ; n > 0xFF; n -= 0xFF {
+		for ; n >= 0xFF; n -= 0xFF {
 			size = append(size, 0xFF)
 		}
+		// The terminating byte is always written, even if the frame size is
+		// a multiple of 255 (e.g. 255 is encoded as 0xFF 0x00).
 		size = append(size, byte(n))
 	}
 	if _, err := l.w.Write(size); err != nil {

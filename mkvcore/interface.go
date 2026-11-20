@@ -17,13 +17,16 @@ package mkvcore
 // BlockWriter is a Matroska block writer interface.
 type BlockWriter interface {
 	// Write a block to the connected Matroska writer.
-	// timestamp is in millisecond.
+	// timestamp is in the Segment Info TimecodeScale unit (normally millisecond).
 	Write(keyframe bool, timestamp int64, b []byte) (int, error)
 }
 
 // BlockReader is a Matroska block reader interface.
 type BlockReader interface {
 	// Read a block from the connected Matroska reader.
+	// timestamp is in the Segment Info TimecodeScale unit (normally millisecond).
+	// Frames packed in one laced block are returned one by one; their
+	// timestamps are derived from the track's DefaultDuration.
 	Read() (b []byte, keyframe bool, timestamp int64, err error)
 }
 

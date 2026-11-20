@@ -192,3 +192,85 @@ func TestBlockWriter_NewSimpleWriter(t *testing.T) {
 		t.Errorf("Unexpected WebM binary,\nexpected: %+v\n     got: %+v", expectedBytes, buf.Bytes())
 	}
 }
+
+func TestBlockWriter_WithLacing(t *testing.T) {
+	buf := buffercloser.New()
+
+	const defaultDuration = 20000000 // 20ms
+	tracks := []TrackEntry{
+		{
+			Name:            "Audio",
+			TrackNumber:     1,
+			TrackUID:        54321,
+			CodecID:         "A_OPUS",
+			TrackType:       2,
+			DefaultDuration: defaultDuration,
+			Audio: &Audio{
+				SamplingFrequency: 48000.0,
+				Channels:          2,
+			},
+		},
+	}
+	ws, err := NewSimpleBlockWriter(buf, tracks, mkvcore.WithLacing(1))
+	if err != nil {
+		t.Fatalf("Failed to create BlockWriter: %v", err)
+	}
+
+	ticks := int64(defaultDuration / DefaultSegmentInfo.TimecodeScale)
+	frames := [][]byte{
+		bytes.Repeat([]byte{0xAA}, 255),
+		bytes.Repeat([]byte{0xCC}, 100),
+		bytes.Repeat([]byte{0x55}, 510),
+		bytes.Repeat([]byte{0x33}, 40),
+	}
+	for i, f := range frames {
+		if _, err := ws[0].Write(true, int64(i)*ticks, f); err != nil {
+			t.Fatalf("Failed to Write: %v", err)
+		}
+	}
+	ws[0].Close()
+	<-buf.Closed()
+
+	// Confirm that the frames were packed into one block.
+	var result struct {
+		Segment struct {
+			Cluster []Cluster `ebml:"Cluster,size=unknown"`
+		} `ebml:"Segment,size=unknown"`
+	}
+	if err := ebml.Unmarshal(bytes.NewReader(buf.Bytes()), &result); err != nil {
+		t.Fatalf("Failed to Unmarshal resultant binary: %v", err)
+	}
+	var blocks []ebml.Block
+	for _, c := range result.Segment.Cluster {
+		blocks = append(blocks, c.SimpleBlock...)
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("Expected 1 block, got %d", len(blocks))
+	}
+	if blocks[0].Lacing == ebml.LacingNo || len(blocks[0].Data) != len(frames) {
+		t.Fatalf("Expected a laced block with %d frames, got lacing=%v with %d frames",
+			len(frames), blocks[0].Lacing, len(blocks[0].Data))
+	}
+
+	// The frames must be read back one by one with the original timestamps.
+	rs, err := mkvcore.NewSimpleBlockReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("Failed to create BlockReader: %v", err)
+	}
+	for i, f := range frames {
+		b, keyframe, timestamp, err := rs[0].Read()
+		if err != nil {
+			t.Fatalf("Failed to Read frame %d: %v", i, err)
+		}
+		if !bytes.Equal(b, f) {
+			t.Errorf("Frame %d data mismatch, expected %v, got %v", i, f, b)
+		}
+		if !keyframe {
+			t.Errorf("Frame %d keyframe flag is lost", i)
+		}
+		if expect := int64(i) * ticks; timestamp != expect {
+			t.Errorf("Frame %d timestamp: expected %d, got %d", i, expect, timestamp)
+		}
+	}
+	rs[0].Close()
+}
