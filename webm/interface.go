@@ -33,6 +33,14 @@ type BlockCloser interface {
 	mkvcore.BlockCloser
 }
 
+// Chunk is a self-contained part of the chunked (segmented) output.
+// See mkvcore.Chunk.
+type Chunk = mkvcore.Chunk
+
+// ChunkHandler receives the initialization segment and each complete media
+// segment. See mkvcore.ChunkHandler.
+type ChunkHandler = mkvcore.ChunkHandler
+
 // BlockWriteCloser groups Writer and Closer.
 type BlockWriteCloser interface {
 	mkvcore.BlockWriteCloser

@@ -91,6 +91,32 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 		}
 	}
 
+	if options.chunkHandler != nil {
+		if options.cuesReservedSize > 0 {
+			return nil, ErrChunkWithCues
+		}
+
+		if options.mainTrackNumber == 0 {
+			// Fall back to the first video track, if the track entries carry
+			// their TrackType.
+			options.mainTrackNumber = inferMainTrackNumber(tracks)
+		}
+		if options.mainTrackNumber == 0 {
+			return nil, ErrChunkRequiresMainTrack
+		}
+
+		found := false
+		for _, t := range tracks {
+			if t.TrackNumber == options.mainTrackNumber {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, ErrChunkMainTrackNotFound
+		}
+	}
+
 	// Validate Cues requirements
 	var writerAt io.WriterAt
 	if options.cuesReservedSize > 0 {
@@ -140,8 +166,27 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 			return nil, err
 		}
 	}
-	if err := ebml.Marshal(&header, w, options.marshalOpts...); err != nil {
-		return nil, err
+
+	if options.chunkHandler != nil {
+		// The header is the initialization segment. It is the exact prefix of
+		// the continuous stream: the Segment keeps its unknown size, so the
+		// media segments appended to it stay inside the Segment element.
+		var buf bytes.Buffer
+		if err := ebml.Marshal(&header, &buf, options.marshalOpts...); err != nil {
+			return nil, err
+		}
+		initData := buf.Bytes()
+		if _, err := w.Write(initData); err != nil {
+			return nil, err
+		}
+		if err := options.chunkHandler(Chunk{Initialization: true, Data: initData}); err != nil {
+			return nil, err
+		}
+		w.Clear()
+	} else {
+		if err := ebml.Marshal(&header, w, options.marshalOpts...); err != nil {
+			return nil, err
+		}
 	}
 
 	// Reserve space for Cues by writing a Void element
@@ -204,6 +249,19 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackDescription, opts ...
 	}()
 
 	go func() {
+		if options.chunkHandler != nil {
+			cw := &chunkWriter{
+				ch:      ch,
+				closed:  closed,
+				options: options,
+				w:       w,
+			}
+			cw.run()
+			// Release blocked Close() of the block writers.
+			<-fin
+			return
+		}
+
 		const invalidTimestamp = int64(0x7FFFFFFFFFFFFFFF)
 		tc0 := invalidTimestamp
 		tc1 := invalidTimestamp

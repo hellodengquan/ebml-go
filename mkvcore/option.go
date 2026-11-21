@@ -35,6 +35,38 @@ var ErrCuesReservedTooSmall = errors.New("WithCues reservedSize must be at least
 // ErrDurationInClusterOutOfRange means that a duration is not in the valid range. Duration in a cluster must be between 0 and 0x7FFF.
 var ErrDurationInClusterOutOfRange = errors.New("duration in cluster out of range")
 
+// ErrChunkRequiresMainTrack means WithChunkHandler was used without a main track
+// and no video track was found in the tracks.
+// A main track is required to start each media segment at a keyframe.
+// Configure it with WithMinMaxClusterDuration or WithMaxKeyframeInterval.
+var ErrChunkRequiresMainTrack = errors.New("WithChunkHandler requires a main track")
+
+// ErrChunkMainTrackNotFound means the main track is not included in the tracks
+// passed to NewSimpleBlockWriter.
+var ErrChunkMainTrackNotFound = errors.New("WithChunkHandler main track is not found in the tracks")
+
+// ErrChunkWithCues means WithChunkHandler was used together with WithCues.
+// Cues are written into a pre-reserved area of a continuous stream and are not
+// available in chunked output.
+var ErrChunkWithCues = errors.New("WithChunkHandler cannot be used with WithCues")
+
+// ErrChunkDurationExceeded is reported through the error handler when a media
+// segment has to stay open longer than the configured maximum cluster duration,
+// because no keyframe of the main track appeared. The segment is still emitted
+// and remains independently decodable.
+var ErrChunkDurationExceeded = errors.New("media segment duration exceeds the maximum cluster duration")
+
+// ErrChunkFrameOutOfRange is reported through the error handler when a frame is
+// too far from its media segment start to be represented in the signed 16-bit
+// SimpleBlock timecode, and the frame is dropped.
+// The current media segment is closed at the next main track keyframe.
+var ErrChunkFrameOutOfRange = errors.New("frame is out of the SimpleBlock timecode range of its media segment")
+
+// ErrChunkFrameBeforeKeyframe is reported through the error handler when a
+// frame is dropped because it is older than the first main track keyframe.
+// Frames which share the timestamp of the opening keyframe are kept.
+var ErrChunkFrameBeforeKeyframe = errors.New("frame older than the first keyframe of the main track is dropped")
+
 // durationSettable is implemented by segment info types that support
 // having their Duration field set automatically (e.g. webm.Info).
 type durationSettable interface {
@@ -106,6 +138,7 @@ type BlockWriterOptions struct {
 	cuesReservedSize   int
 	minClusterDuration int64
 	maxClusterDuration int64
+	chunkHandler       ChunkHandler
 }
 
 // WithEBMLHeader sets EBML header.
@@ -202,6 +235,42 @@ func WithMinMaxClusterDuration(mainTrackNumber uint64, minDuration, maxDuration 
 		o.mainTrackNumber = mainTrackNumber
 		o.minClusterDuration = minDuration
 		o.maxClusterDuration = maxDuration
+		return nil
+	}
+}
+
+// WithChunkHandler enables chunked (segmented) output and registers the
+// handler which receives the initialization segment and each complete media
+// segment.
+//
+// The output is split into:
+//   - one initialization segment containing the EBML header, Segment header,
+//     Info and Tracks, and
+//   - a sequence of media segments, each of which consists of exactly one
+//     Cluster element and starts at a keyframe of the main track.
+//
+// Media segments are delivered to the handler as soon as they are complete and
+// can be appended to a browser SourceBuffer (MSE) or served as DASH/HLS
+// fragments. Concatenating the initialization segment and all media segments
+// in the delivery order yields a regular, valid WebM stream readable by this
+// library.
+//
+// Chunked output requires a main track. It is configured with
+// WithMinMaxClusterDuration or WithMaxKeyframeInterval, or, if not configured,
+// inferred as the first video track whose TrackEntry carries TrackType.
+// WithSeekHead is available; the SeekHead is part of the initialization
+// segment. WithCues is not available in chunked output and is rejected.
+//
+// When chunked output is enabled, the io.WriteCloser passed to
+// NewSimpleBlockWriter receives the initialization segment and every media
+// segment, in addition to the handler. It can be a writer discarding the data
+// if only the handler is used.
+//
+// Without WithChunkHandler, the output is a single continuous stream and is
+// unchanged.
+func WithChunkHandler(handler ChunkHandler) BlockWriterOptionFn {
+	return func(o *BlockWriterOptions) error {
+		o.chunkHandler = handler
 		return nil
 	}
 }

@@ -18,6 +18,26 @@ Check out the examples placed under [./examples](./examples/) directory.
 API is documented using [GoDoc](http://godoc.org/github.com/at-wat/ebml-go).
 EBML can be `Marshal`-ed and `Unmarshal`-ed between tagged struct and binary stream through `io.Reader` and `io.Writer`.
 
+### Chunked (segmented) WebM output
+
+For browser MSE (Media Source Extensions) and DASH/HLS live streaming, the
+output can be split into an initialization segment and a sequence of media
+segments by passing `mkvcore.WithChunkHandler` (or using
+`webm.NewChunkWriter` / `webm.NewSimpleChunkWriter`):
+
+- The initialization segment contains the EBML header, Segment header, Info and
+  Tracks.
+- Each media segment is a single Cluster element starting at a main track
+  keyframe, so it is independently decodable and can be appended to a browser
+  `SourceBuffer`.
+- Each `Chunk` reports its start and end time. The time ranges of adjacent
+  media segments are contiguous and do not overlap.
+- Concatenating the initialization segment and all media segments yields a
+  regular WebM stream readable by this library.
+- Without a chunk handler, the output is the unchanged continuous stream.
+
+See [./examples/chunked-webm](./examples/chunked-webm) for an example.
+
 
 ## References
 

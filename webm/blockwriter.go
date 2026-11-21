@@ -25,6 +25,9 @@ import (
 // Blocks will be written to WebM as EBML SimpleBlocks.
 // Resultant WebM is written to given io.WriteCloser and will be closed automatically; don't close it by yourself.
 // Frames written to each track must be sorted by their timestamp.
+//
+// To use the output as an MSE/DASH live stream, pass WithChunkHandler to split
+// the output into an initialization segment and media segments.
 func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackEntry, opts ...mkvcore.BlockWriterOption) ([]BlockWriteCloser, error) {
 	trackDesc := []mkvcore.TrackDescription{}
 	for _, t := range tracks {
@@ -46,6 +49,60 @@ func NewSimpleBlockWriter(w0 io.WriteCloser, tracks []TrackEntry, opts ...mkvcor
 		webmWs = append(webmWs, BlockWriteCloser(w))
 	}
 	return webmWs, err
+}
+
+// NewChunkWriter creates BlockWriteCloser for each track specified as tracks argument
+// and splits the output into an initialization segment and media segments.
+//
+// It is a shorthand of NewSimpleBlockWriter with WithChunkHandler and a main
+// track configuration. The initialization segment and each complete media
+// segment are passed to handler; see mkvcore.WithChunkHandler for the delivery
+// and segmentation contract. The chunks are also written to w0, so that
+// concatenating all of them yields a regular WebM stream readable by this
+// library.
+//
+// mainTrackNumber is the track number of the main (usually video) track.
+// Each media segment starts at a keyframe of it.
+// minDuration and maxDuration are the preferred minimum and maximum media
+// segment duration in the timecode scale.
+// See mkvcore.WithMinMaxClusterDuration for their semantics.
+//
+// WithChunkHandler in opts is overridden by handler.
+// WithCues is not available in chunked output; io.WriteCloser argument is
+// closed automatically; don't close it by yourself.
+func NewChunkWriter(
+	w0 io.WriteCloser, tracks []TrackEntry, mainTrackNumber uint64,
+	minDuration, maxDuration int64, handler mkvcore.ChunkHandler,
+	opts ...mkvcore.BlockWriterOption,
+) ([]BlockWriteCloser, error) {
+	options := []mkvcore.BlockWriterOption{
+		mkvcore.WithMinMaxClusterDuration(mainTrackNumber, minDuration, maxDuration),
+		mkvcore.WithChunkHandler(handler),
+	}
+	options = append(options, opts...)
+	return NewSimpleBlockWriter(w0, tracks, options...)
+}
+
+// NewSimpleChunkWriter creates BlockWriteCloser for each track specified as
+// tracks argument and splits the output into an initialization segment and
+// media segments.
+//
+// It is a shorthand of NewSimpleBlockWriter with WithChunkHandler.
+// The main track and media segment duration are inferred or configured by
+// opts. If not configured, the first video track is used as the main track and
+// the default maximum cluster duration is used.
+// The default block interceptor and default WebM header/info are applied.
+//
+// See mkvcore.WithChunkHandler for the segmentation contract.
+func NewSimpleChunkWriter(
+	w0 io.WriteCloser, tracks []TrackEntry, handler mkvcore.ChunkHandler,
+	opts ...mkvcore.BlockWriterOption,
+) ([]BlockWriteCloser, error) {
+	options := []mkvcore.BlockWriterOption{
+		mkvcore.WithChunkHandler(handler),
+	}
+	options = append(options, opts...)
+	return NewSimpleBlockWriter(w0, tracks, options...)
 }
 
 // NewSimpleWriter creates BlockWriteCloser for each track specified as tracks argument.
